@@ -13,18 +13,13 @@ import Point from 'ol/geom/Point';
 import Polygon from 'ol/geom/Polygon';
 import TileLayer from 'ol/layer/Tile';
 import VectorLayer from 'ol/layer/Vector';
-import OSM from 'ol/source/OSM';
 import Cluster from 'ol/source/Cluster';
 import VectorSource from 'ol/source/Vector';
 import XYZ from 'ol/source/XYZ';
 import { Fill, Stroke, Style, Text, Circle as CircleStyle } from 'ol/style';
 import { fromLonLat, toLonLat, transformExtent } from 'ol/proj';
+import { createEmpty as createEmptyExtent, extend as extendExtent } from 'ol/extent';
 import { getArea, getLength } from 'ol/sphere';
-
-import {
-  poiFeatureCollection as fallbackPoiFeatureCollection,
-  roadFeatureCollection as fallbackRoadFeatureCollection
-} from './data/mockData.js';
 
 const ROAD_TYPE_LABEL_MAP = {
   highway: '高速公路',
@@ -54,7 +49,7 @@ const geoserverPoiLayer = import.meta.env.VITE_GEOSERVER_POI_LAYER?.trim() || 't
 const POI_MIN_LOAD_ZOOM = 12.5;
 const POI_LABEL_MIN_ZOOM = 14;
 const POI_CLUSTER_DISTANCE = 42;
-const POI_CLUSTER_MIN_DISTANCE = 18;
+const POI_CLUSTER_MIN_DISTANCE = 0;
 const POI_REQUEST_DEBOUNCE_MS = 180;
 const POI_CATEGORY_MAP = {
   bus: 'bus',
@@ -73,6 +68,20 @@ const POI_CATEGORY_LABEL_MAP = {
   bus: '\u516c\u4ea4\u7ad9',
   school: '\u5b66\u6821',
   hospital: '\u533b\u9662'
+};
+const ROUTE_META = {
+  distance: {
+    label: '距离最短',
+    color: '#2563eb',
+    width: 8,
+    lineDash: []
+  },
+  time: {
+    label: '时间最短',
+    color: '#f97316',
+    width: 5,
+    lineDash: [16, 10]
+  }
 };
 
 function repairLikelyGbkMojibake(value) {
@@ -186,8 +195,8 @@ async function loadRoadFeatureCollection() {
 
     return normalizedFeatureCollection;
   } catch (error) {
-    console.error('Failed to load road data from GeoServer WFS, falling back to local mock data.', error);
-    return normalizeRoadFeatureCollection(fallbackRoadFeatureCollection);
+    console.error('Failed to load road data from GeoServer WFS.', error);
+    return createEmptyFeatureCollection();
   }
 }
 
@@ -195,24 +204,6 @@ function createEmptyFeatureCollection() {
   return {
     type: 'FeatureCollection',
     features: []
-  };
-}
-
-function filterPoiFeatureCollectionByExtent(featureCollection, extent4326) {
-  const [minX, minY, maxX, maxY] = extent4326;
-
-  return {
-    type: 'FeatureCollection',
-    features: (featureCollection?.features || []).filter((feature) => {
-      const coordinates = feature?.geometry?.coordinates;
-      return (
-        Array.isArray(coordinates) &&
-        coordinates[0] >= minX &&
-        coordinates[0] <= maxX &&
-        coordinates[1] >= minY &&
-        coordinates[1] <= maxY
-      );
-    })
   };
 }
 
@@ -262,7 +253,6 @@ function normalizePoiFeatureCollection(featureCollection) {
 }
 
 async function loadPoiFeatureCollection(extent4326) {
-  const wfsUrl = 'http://localhost:8080/geoserver/traffic/wfs';
   const params = new URLSearchParams({
     service: 'WFS',
     version: '1.1.0',
@@ -275,82 +265,22 @@ async function loadPoiFeatureCollection(extent4326) {
 
   if (extent4326) {
     const [minX, minY, maxX, maxY] = extent4326;
-    console.log('使用空间范围过滤:', { minX, minY, maxX, maxY });
-    // 尝试不同的BBOX语法
     params.set('cql_filter', `BBOX(geom,${minX},${minY},${maxX},${maxY},'EPSG:4326')`);
   }
 
   try {
-    const fullUrl = `${wfsUrl}?${params.toString()}`;
-    console.log('请求POI数据:', fullUrl);
+    const fullUrl = `${geoserverWfsUrl}?${params.toString()}`;
     const response = await fetch(fullUrl);
     if (!response.ok) {
       throw new Error(`WFS request failed with ${response.status}`);
     }
 
     const featureCollection = await response.json();
-    console.log('获取到POI数据:', featureCollection.features.length, '个特征');
-    
-    // 打印前几个POI的完整数据，看看它们的结构
-    if (featureCollection.features.length > 0) {
-      console.log('第一个POI的完整数据:', featureCollection.features[0]);
-      if (featureCollection.features.length > 1) {
-        console.log('第二个POI的完整数据:', featureCollection.features[1]);
-      }
-    }
-    
     const normalizedFeatureCollection = normalizePoiFeatureCollection(featureCollection);
-    console.log('标准化后POI数据:', normalizedFeatureCollection.features.length, '个特征');
-
-    // 如果WFS返回空数据，尝试不带空间过滤的请求
-    if (!normalizedFeatureCollection.features.length && extent4326) {
-      console.log('带空间过滤的请求返回空数据，尝试不带空间过滤的请求');
-      const paramsWithoutBbox = new URLSearchParams({
-        service: 'WFS',
-        version: '1.1.0',
-        request: 'GetFeature',
-        typeName: geoserverPoiLayer,
-        outputFormat: 'application/json',
-        srsName: 'EPSG:4326',
-        propertyName: 'poi_id,name,category,category_label,geom'
-      });
-      const fullUrlWithoutBbox = `${wfsUrl}?${paramsWithoutBbox.toString()}`;
-      console.log('请求POI数据（不带空间过滤）:', fullUrlWithoutBbox);
-      const responseWithoutBbox = await fetch(fullUrlWithoutBbox);
-      if (responseWithoutBbox.ok) {
-        const featureCollectionWithoutBbox = await responseWithoutBbox.json();
-        console.log('不带空间过滤获取到POI数据:', featureCollectionWithoutBbox.features.length, '个特征');
-        const normalizedFeatureCollectionWithoutBbox = normalizePoiFeatureCollection(featureCollectionWithoutBbox);
-        if (normalizedFeatureCollectionWithoutBbox.features.length) {
-          return normalizedFeatureCollectionWithoutBbox;
-        }
-      }
-    }
-
-    // 如果WFS返回空数据，使用mock数据作为备选
-    if (!normalizedFeatureCollection.features.length) {
-      console.log('WFS返回空数据，使用mock数据作为备选');
-      if (extent4326) {
-        return filterPoiFeatureCollectionByExtent(
-          normalizePoiFeatureCollection(fallbackPoiFeatureCollection),
-          extent4326
-        );
-      } else {
-        return normalizePoiFeatureCollection(fallbackPoiFeatureCollection);
-      }
-    }
-
     return normalizedFeatureCollection;
   } catch (error) {
-    console.error('Failed to load POI data from GeoServer WFS, falling back to local mock data.', error);
-    if (extent4326) {
-      return filterPoiFeatureCollectionByExtent(
-        normalizePoiFeatureCollection(fallbackPoiFeatureCollection),
-        extent4326
-      );
-    } else {
-      return normalizePoiFeatureCollection(fallbackPoiFeatureCollection);
-    }
+    console.error('Failed to load POI data from GeoServer WFS.', error);
+    return createEmptyFeatureCollection();
   }
 }
 
@@ -367,9 +297,9 @@ function getLayerCounts(roadFeatureCollection, poiFeatureCollection) {
 }
 
 const app = document.querySelector('#app');
-let roadFeatureCollection = normalizeRoadFeatureCollection(fallbackRoadFeatureCollection);
+let roadFeatureCollection = createEmptyFeatureCollection();
 let poiFeatureCollection = createEmptyFeatureCollection();
-let allPoiFeatureCollection = normalizePoiFeatureCollection(fallbackPoiFeatureCollection);
+let allPoiFeatureCollection = createEmptyFeatureCollection();
 let LAYER_COUNTS = getLayerCounts(roadFeatureCollection, allPoiFeatureCollection);
 
 app.innerHTML = `
@@ -382,8 +312,6 @@ app.innerHTML = `
         </div>
       </div>
       <div class="topbar-right">
-        <span class="service-pill" id="tdt-status-pill">天地图未配置</span>
-        <span class="service-pill is-ready">GeoServer / PostGIS</span>
         <div class="clock-inline">
           <strong id="clock-time">--:--:--</strong>
           <span id="clock-date">----</span>
@@ -415,7 +343,7 @@ app.innerHTML = `
         <div class="sidebar-drawer">
           <div class="drawer-header">
             <h2 id="drawer-title">图层控制</h2>
-            <span id="status-base" class="drawer-chip">底图：OSM</span>
+            <span id="status-base" class="drawer-chip">底图：无底图</span>
           </div>
 
           <div class="panel-stack">
@@ -476,7 +404,7 @@ app.innerHTML = `
                     </span>
                     <span class="layer-side">
                       <span class="layer-count">${LAYER_COUNTS.bus}处</span>
-                      <input class="layer-toggle" type="checkbox" data-layer="bus" checked />
+                      <input class="layer-toggle" type="checkbox" data-layer="bus" />
                     </span>
                   </label>
                   <label class="layer-row">
@@ -486,7 +414,7 @@ app.innerHTML = `
                     </span>
                     <span class="layer-side">
                       <span class="layer-count">${LAYER_COUNTS.school}处</span>
-                      <input class="layer-toggle" type="checkbox" data-layer="school" checked />
+                      <input class="layer-toggle" type="checkbox" data-layer="school" />
                     </span>
                   </label>
                   <label class="layer-row">
@@ -496,7 +424,7 @@ app.innerHTML = `
                     </span>
                     <span class="layer-side">
                       <span class="layer-count">${LAYER_COUNTS.hospital}处</span>
-                      <input class="layer-toggle" type="checkbox" data-layer="hospital" checked />
+                      <input class="layer-toggle" type="checkbox" data-layer="hospital" />
                     </span>
                   </label>
                 </div>
@@ -567,10 +495,7 @@ app.innerHTML = `
             <section class="panel-view" data-panel-view="monitor">
               <div class="mini-section">
                 <div class="subsection-title">路况信息</div>
-                <div class="empty-state monitor-empty-state">
-                  暂未接入实时路况数据。后续可在 PostgreSQL 中关联 <code>status</code>、
-                  <code>current_speed</code> 和 <code>speed_limit</code> 字段后再进行展示。
-                </div>
+                <div class="empty-state monitor-empty-state">暂无实时路况数据。</div>
               </div>
             </section>
           </div>
@@ -592,7 +517,7 @@ app.innerHTML = `
 
           <div class="map-float-card overlay-top-right base-switch-float">
             <div class="base-switch-grid">
-              <button class="base-button is-active" data-base="osm">OSM</button>
+              <button class="base-button is-active" data-base="none">无底图</button>
               <button class="base-button" data-base="tdtVector">天地图矢量</button>
               <button class="base-button" data-base="tdtImage">天地图影像</button>
             </div>
@@ -650,7 +575,6 @@ const refs = {
   drawerTitle: document.querySelector('#drawer-title'),
   clockTime: document.querySelector('#clock-time'),
   clockDate: document.querySelector('#clock-date'),
-  tdtStatus: document.querySelector('#tdt-status-pill'),
   featureDetail: document.querySelector('#feature-detail'),
   searchForm: document.querySelector('#search-form'),
   searchInput: document.querySelector('#search-input'),
@@ -690,10 +614,11 @@ let poiFeatures = geoJsonFormat.readFeatures(poiFeatureCollection, {
 
 const state = {
   currentMode: 'query',
-  activeBase: 'osm',
+  activeBase: 'none',
   drawInteraction: null,
   routeStart: null,
-  routeEnd: null
+  routeEnd: null,
+  routes: []
 };
 
 const roadLayers = {};
@@ -717,8 +642,8 @@ const tdtKey = import.meta.env.VITE_TDT_KEY?.trim();
 const hasTdtKey = Boolean(tdtKey);
 
 const baseLayers = {
-  osm: new TileLayer({
-    source: new OSM(),
+  none: new VectorLayer({
+    source: new VectorSource(),
     visible: true
   }),
   tdtVector: new TileLayer({
@@ -726,7 +651,7 @@ const baseLayers = {
       ? buildTileSource(
           `https://t{s}.tianditu.gov.cn/DataServer?T=vec_w&x={x}&y={y}&l={z}&tk=${tdtKey}`
         )
-      : new OSM(),
+      : undefined,
     visible: false
   }),
   tdtImage: new TileLayer({
@@ -734,7 +659,7 @@ const baseLayers = {
       ? buildTileSource(
           `https://t{s}.tianditu.gov.cn/DataServer?T=img_w&x={x}&y={y}&l={z}&tk=${tdtKey}`
         )
-      : new OSM(),
+      : undefined,
     visible: false
   })
 };
@@ -766,26 +691,41 @@ Object.entries(POI_META).forEach(([category, meta]) => {
     source: clusterSource,
     declutter: true,
     minZoom: POI_MIN_LOAD_ZOOM,
+    visible: false,
     zIndex: 30,
     style: createPoiStyle(meta)
   });
 });
 
-const routeSource = new VectorSource();
+const routeSources = {
+  distance: new VectorSource(),
+  time: new VectorSource()
+};
 const markerSource = new VectorSource();
 const selectionSource = new VectorSource();
 const measureSource = new VectorSource();
 
-const routeLayer = new VectorLayer({
-  source: routeSource,
-  style: new Style({
-    stroke: new Stroke({
-      color: '#38bdf8',
-      width: 6,
-      lineDash: [16, 10]
+const routeLayers = {
+  distance: new VectorLayer({
+    source: routeSources.distance,
+    style: new Style({
+      stroke: new Stroke({
+        color: ROUTE_META.distance.color,
+        width: ROUTE_META.distance.width
+      })
+    })
+  }),
+  time: new VectorLayer({
+    source: routeSources.time,
+    style: new Style({
+      stroke: new Stroke({
+        color: ROUTE_META.time.color,
+        width: ROUTE_META.time.width,
+        lineDash: ROUTE_META.time.lineDash
+      })
     })
   })
-});
+};
 
 const markerLayer = new VectorLayer({
   source: markerSource,
@@ -829,12 +769,12 @@ const map = new Map({
     attribution: false
   }).extend([new ScaleLine()]),
   layers: [
-    baseLayers.osm,
+    baseLayers.none,
     baseLayers.tdtVector,
     baseLayers.tdtImage,
     ...Object.values(roadLayers),
     ...Object.values(poiLayers),
-    routeLayer,
+    ...Object.values(routeLayers),
     markerLayer,
     selectionLayer,
     measureLayer
@@ -895,11 +835,17 @@ map.on('singleclick', (event) => {
   const clusteredFeatures = feature.get('features');
   if (Array.isArray(clusteredFeatures) && clusteredFeatures.length > 1) {
     const view = map.getView();
-    view.animate({
-      center: event.coordinate,
-      zoom: Math.min((view.getZoom() ?? POI_MIN_LOAD_ZOOM) + 2, view.getMaxZoom()),
-      duration: 250
-    });
+    const canZoomFurther = (view.getZoom() ?? 0) < (view.getMaxZoom() ?? 18);
+
+    if (canZoomFurther && hasMultipleClusterLocations(clusteredFeatures)) {
+      view.animate({
+        center: event.coordinate,
+        zoom: Math.min((view.getZoom() ?? POI_MIN_LOAD_ZOOM) + 2, view.getMaxZoom()),
+        duration: 250
+      });
+    } else {
+      focusClusterMembers(clusteredFeatures, event.coordinate);
+    }
     return;
   }
 
@@ -943,7 +889,7 @@ function initializeControls() {
   document.querySelectorAll('[data-base]').forEach((button) => {
     button.addEventListener('click', () => {
       const nextBase = button.dataset.base;
-      if (!hasTdtKey && nextBase !== 'osm') {
+      if (!hasTdtKey && nextBase !== 'none') {
         refs.measureBanner.textContent = '天地图底图未启用，请在 .env 中配置 VITE_TDT_KEY。';
         return;
       }
@@ -998,7 +944,32 @@ function initializeControls() {
     });
   });
 
-  refs.buildRouteButton.addEventListener('click', buildDemoRoute);
+  refs.popupContent.addEventListener('click', (event) => {
+    const target = event.target.closest('[data-feature-type]');
+    if (!target) {
+      return;
+    }
+
+    const feature = findFeature(target.dataset.featureType, target.dataset.featureId);
+    if (!feature) {
+      return;
+    }
+
+    const geometry = feature.getGeometry();
+    const coordinate =
+      geometry.getType() === 'Point'
+        ? geometry.getCoordinates()
+        : geometry.getClosestPoint(map.getView().getCenter());
+
+    focusFeature(feature, coordinate);
+    map.getView().animate({
+      center: coordinate,
+      zoom: Math.max(map.getView().getZoom() ?? POI_LABEL_MIN_ZOOM, POI_LABEL_MIN_ZOOM),
+      duration: 300
+    });
+  });
+
+  refs.buildRouteButton.addEventListener('click', buildRoute);
   refs.clearRouteButton.addEventListener('click', clearRoute);
   document.querySelector('#clear-measure-btn').addEventListener('click', clearMeasure);
   refs.popupCloser.addEventListener('click', () => popupOverlay.setPosition(undefined));
@@ -1029,15 +1000,11 @@ function switchPanel(panelName) {
 }
 
 function applyTdtAvailability() {
-  if (hasTdtKey) {
-    refs.tdtStatus.textContent = '天地图 Key 已配置';
-    refs.tdtStatus.classList.add('is-ready');
-    return;
+  if (!hasTdtKey) {
+    document.querySelectorAll('[data-base="tdtVector"], [data-base="tdtImage"]').forEach((button) => {
+      button.classList.add('is-disabled');
+    });
   }
-
-  document.querySelectorAll('[data-base="tdtVector"], [data-base="tdtImage"]').forEach((button) => {
-    button.classList.add('is-disabled');
-  });
 }
 
 function switchBaseLayer(baseKey) {
@@ -1052,7 +1019,7 @@ function switchBaseLayer(baseKey) {
   });
 
   const labelMap = {
-    osm: 'OSM 标准图',
+    none: '无底图',
     tdtVector: '天地图矢量',
     tdtImage: '天地图影像'
   };
@@ -1197,6 +1164,49 @@ function findFeature(type, id) {
   return null;
 }
 
+function hasMultipleClusterLocations(features) {
+  const coordinateKeys = new Set(
+    features
+      .map((feature) => feature.getGeometry()?.getCoordinates?.())
+      .filter((coordinate) => Array.isArray(coordinate) && coordinate.length >= 2)
+      .map(([x, y]) => `${x.toFixed(6)},${y.toFixed(6)}`)
+  );
+
+  return coordinateKeys.size > 1;
+}
+
+function renderClusterMemberButtons(features) {
+  return features
+    .map((feature) => {
+      const properties = feature.getProperties();
+      return `
+        <button class="result-item cluster-member-item" type="button" data-feature-type="poi" data-feature-id="${properties.poiId}">
+          <span>${properties.name}</span>
+          <strong>${properties.categoryLabel}</strong>
+        </button>
+      `;
+    })
+    .join('');
+}
+
+function focusClusterMembers(features, coordinate) {
+  const content = renderClusterMemberButtons(features);
+
+  selectionSource.clear();
+  refs.featureDetail.className = 'feature-detail';
+  refs.featureDetail.innerHTML = `
+    <div class="detail-title">聚合兴趣点</div>
+    <div class="detail-note">当前层级仍有 ${features.length} 个兴趣点重叠，请点击下方条目查看详情。</div>
+    <div class="search-results cluster-member-list">${content}</div>
+  `;
+  refs.popupContent.innerHTML = `
+    <div class="popup-title">聚合兴趣点</div>
+    <div class="popup-row">共 ${features.length} 个兴趣点</div>
+    <div class="search-results cluster-member-list">${content}</div>
+  `;
+  popupOverlay.setPosition(coordinate);
+}
+
 function focusFeature(feature, coordinate) {
   selectionSource.clear();
   selectionSource.addFeature(feature.clone());
@@ -1213,7 +1223,7 @@ function focusFeature(feature, coordinate) {
         <div><span>类型</span><strong>${properties.typeLabel}</strong></div>
         <div><span>编号</span><strong>${properties.roadId}</strong></div>
       </div>
-      <div class="detail-note">实时路况信息已移至“监控”面板，待数据库关联后展示。</div>
+      <div class="detail-note">实时路况信息请在“监控”面板查看。</div>
     `;
     refs.popupContent.innerHTML = `
       <div class="popup-title">${properties.name}</div>
@@ -1225,13 +1235,11 @@ function focusFeature(feature, coordinate) {
       <div class="detail-title">${properties.name}</div>
       <div class="detail-grid">
         <div><span>类别</span><strong>${properties.categoryLabel}</strong></div>
-        <div><span>用途</span><strong>空间兴趣点查询</strong></div>
       </div>
     `;
     refs.popupContent.innerHTML = `
       <div class="popup-title">${properties.name}</div>
       <div class="popup-row">兴趣点类别：${properties.categoryLabel}</div>
-      <div class="popup-row">可接入附近设施检索与缓冲分析</div>
     `;
   }
 
@@ -1267,279 +1275,190 @@ function updateMarkers() {
   }
 }
 
-async function buildDemoRoute() {
+async function buildRoute() {
   if (!state.routeStart || !state.routeEnd) {
     refs.measureBanner.textContent = '请先在地图上分别设置起点与终点。';
     return;
   }
 
-  routeSource.clear();
+  Object.values(routeSources).forEach((source) => source.clear());
+  state.routes = [];
+  renderRouteSummary();
   refs.measureBanner.textContent = '正在规划路径...';
 
   try {
-    // 调用真实的路径规划服务
     const routeData = await fetchRouteData(state.routeStart, state.routeEnd);
-    
-    if (!routeData || !routeData.coordinates) {
-      throw new Error('路径规划失败');
+    state.routes = routeData.routes;
+
+    if (!state.routes.length) {
+      throw new Error('未返回有效路径');
     }
 
-    // 处理路径数据
-    const routeCoordinates = routeData.coordinates;
-    const routeFeature = new Feature({
-      geometry: new LineString(routeCoordinates.map((coordinate) => fromLonLat(coordinate)))
+    state.routes.forEach((route) => {
+      const transformedCoordinates = route.coordinates.map((coordinate) => fromLonLat(coordinate));
+      routeSources[route.key].addFeature(
+        new Feature({
+          geometry: new LineString(transformedCoordinates),
+          routeKey: route.key
+        })
+      );
     });
-    routeSource.addFeature(routeFeature);
 
-    // 计算路径长度和预计时间
-    const length = routeData.distance || getLength(new LineString(routeCoordinates), { projection: 'EPSG:4326' });
-    const estimatedTime = routeData.duration || (length / 1000 / 42) * 60;
-
-    refs.routeSummary.innerHTML = `
-      <div class="summary-row"><span>起点</span><strong>${formatPoint(state.routeStart)}</strong></div>
-      <div class="summary-row"><span>终点</span><strong>${formatPoint(state.routeEnd)}</strong></div>
-      <div class="summary-row"><span>路径长度</span><strong>${formatDistance(length)}</strong></div>
-      <div class="summary-row"><span>预计耗时</span><strong>${estimatedTime.toFixed(1)} 分钟</strong></div>
-    `;
-
+    renderRouteSummary();
+    fitRouteFeatures();
     refs.measureBanner.textContent = '路径规划完成。';
+  } catch (error) {
+    console.error('路径规划失败:', error);
+    state.routes = [];
+    renderRouteSummary();
+    refs.measureBanner.textContent = '路径规划失败，请检查路径服务和路网数据。';
+  }
+}
 
-    map.getView().fit(routeFeature.getGeometry(), {
+function fitRouteFeatures() {
+  const extent = createEmptyExtent();
+  let hasFeature = false;
+
+  Object.values(routeSources).forEach((source) => {
+    source.getFeatures().forEach((feature) => {
+      extendExtent(extent, feature.getGeometry().getExtent());
+      hasFeature = true;
+    });
+  });
+
+  if (hasFeature) {
+    map.getView().fit(extent, {
       padding: [120, 120, 120, 120],
       duration: 600
     });
-  } catch (error) {
-    console.error('路径规划失败:', error);
-    refs.measureBanner.textContent = '路径规划失败，请重试。';
-    // 失败时使用模拟路径
-    const routeCoordinates = generateRouteCoordinates(state.routeStart, state.routeEnd);
-    const routeFeature = new Feature({
-      geometry: new LineString(routeCoordinates.map((coordinate) => fromLonLat(coordinate)))
-    });
-    routeSource.addFeature(routeFeature);
-    
-    const length = getLength(new LineString(routeCoordinates), { projection: 'EPSG:4326' });
-    const estimatedTime = (length / 1000 / 42) * 60;
-    
-    refs.routeSummary.innerHTML = `
-      <div class="summary-row"><span>起点</span><strong>${formatPoint(state.routeStart)}</strong></div>
-      <div class="summary-row"><span>终点</span><strong>${formatPoint(state.routeEnd)}</strong></div>
-      <div class="summary-row"><span>路径长度</span><strong>${formatDistance(length)}</strong></div>
-      <div class="summary-row"><span>预计耗时</span><strong>${estimatedTime.toFixed(1)} 分钟</strong></div>
-      <div class="summary-row"><span>备注</span><strong>使用模拟路径</strong></div>
-    `;
   }
 }
 
-async function fetchRouteData(start, end) {
-  // 使用自有道路数据进行路径分析
-  try {
-    // 构建道路网络
-    const roadNetwork = buildRoadNetwork(roadFeatures);
-    
-    // 找到起点和终点附近的道路
-    const startRoad = findNearestRoad(start, roadFeatures);
-    const endRoad = findNearestRoad(end, roadFeatures);
-    
-    if (!startRoad || !endRoad) {
-      throw new Error('无法找到起点或终点附近的道路');
-    }
-    
-    // 使用Dijkstra算法计算最短路径
-    const shortestPath = dijkstraAlgorithm(roadNetwork, startRoad.getId(), endRoad.getId());
-    
-    if (!shortestPath || shortestPath.length === 0) {
-      throw new Error('无法找到可行路径');
-    }
-    
-    // 构建路径坐标
-    const routeCoordinates = buildRouteCoordinatesFromPath(shortestPath, roadFeatures);
-    
-    // 计算路径长度
-    const length = calculateRouteLength(routeCoordinates);
-    const estimatedTime = (length / 1000 / 42) * 60; // 假设平均速度42 km/h
-    
-    return {
-      coordinates: routeCoordinates,
-      distance: length,
-      duration: estimatedTime
-    };
-  } catch (error) {
-    console.error('路径规划失败:', error);
-    return null;
+function areSameCoordinate(left, right, tolerance = 1e-9) {
+  if (!Array.isArray(left) || !Array.isArray(right) || left.length < 2 || right.length < 2) {
+    return false;
   }
+
+  return Math.abs(left[0] - right[0]) <= tolerance && Math.abs(left[1] - right[1]) <= tolerance;
 }
 
-function buildRoadNetwork(roads) {
-  const network = {};
-  
-  roads.forEach((road) => {
-    const roadId = road.getId();
-    network[roadId] = {
-      id: roadId,
-      neighbors: [],
-      length: calculateRoadLength(road)
-    };
-    
-    // 这里简化处理，实际应该根据道路的连接关系构建邻接表
-    // 为了演示，我们假设所有道路都相互连接
-    roads.forEach((otherRoad) => {
-      const otherRoadId = otherRoad.getId();
-      if (roadId !== otherRoadId) {
-        network[roadId].neighbors.push({
-          id: otherRoadId,
-          distance: calculateDistanceBetweenRoads(road, otherRoad)
-        });
-      }
-    });
+function normalizeRouteCoordinates(coordinates) {
+  const normalized = [];
+
+  coordinates.forEach((coordinate) => {
+    if (!Array.isArray(coordinate) || coordinate.length < 2) {
+      return;
+    }
+
+    const cleanCoordinate = [Number(coordinate[0]), Number(coordinate[1])];
+    if (!Number.isFinite(cleanCoordinate[0]) || !Number.isFinite(cleanCoordinate[1])) {
+      return;
+    }
+
+    if (!normalized.length || !areSameCoordinate(normalized[normalized.length - 1], cleanCoordinate)) {
+      normalized.push(cleanCoordinate);
+    }
   });
-  
-  return network;
+
+  return normalized;
 }
 
-function findNearestRoad(point, roads) {
-  let nearestRoad = null;
-  let minDistance = Infinity;
-  
-  roads.forEach((road) => {
-    const distance = calculateDistanceFromPointToRoad(point, road);
-    if (distance < minDistance) {
-      minDistance = distance;
-      nearestRoad = road;
-    }
-  });
-  
-  return nearestRoad;
-}
-
-function dijkstraAlgorithm(network, startId, endId) {
-  const distances = {};
-  const previous = {};
-  const priorityQueue = [];
-  
-  // 初始化距离
-  Object.keys(network).forEach((nodeId) => {
-    distances[nodeId] = Infinity;
-    previous[nodeId] = null;
-  });
-  
-  distances[startId] = 0;
-  priorityQueue.push({ id: startId, distance: 0 });
-  
-  while (priorityQueue.length > 0) {
-    // 按距离排序并取出最近的节点
-    priorityQueue.sort((a, b) => a.distance - b.distance);
-    const current = priorityQueue.shift();
-    
-    if (current.id === endId) {
-      // 构建路径
-      const path = [];
-      let node = endId;
-      while (node) {
-        path.unshift(node);
-        node = previous[node];
-      }
-      return path;
-    }
-    
-    if (current.distance > distances[current.id]) {
-      continue;
-    }
-    
-    // 遍历邻居
-    network[current.id].neighbors.forEach((neighbor) => {
-      const newDistance = distances[current.id] + neighbor.distance;
-      if (newDistance < distances[neighbor.id]) {
-        distances[neighbor.id] = newDistance;
-        previous[neighbor.id] = current.id;
-        priorityQueue.push({ id: neighbor.id, distance: newDistance });
-      }
-    });
+function appendRouteSegment(target, segment) {
+  const normalizedSegment = normalizeRouteCoordinates(segment);
+  if (!normalizedSegment.length) {
+    return;
   }
-  
+
+  if (!target.length) {
+    target.push(...normalizedSegment);
+    return;
+  }
+
+  const lastCoordinate = target[target.length - 1];
+  const startDistance =
+    Math.pow(lastCoordinate[0] - normalizedSegment[0][0], 2) +
+    Math.pow(lastCoordinate[1] - normalizedSegment[0][1], 2);
+  const endDistance =
+    Math.pow(lastCoordinate[0] - normalizedSegment[normalizedSegment.length - 1][0], 2) +
+    Math.pow(lastCoordinate[1] - normalizedSegment[normalizedSegment.length - 1][1], 2);
+  const orientedSegment = endDistance < startDistance ? [...normalizedSegment].reverse() : normalizedSegment;
+
+  orientedSegment.forEach((coordinate) => {
+    if (!areSameCoordinate(target[target.length - 1], coordinate)) {
+      target.push(coordinate);
+    }
+  });
+}
+
+function extractRouteCoordinates(routeGeometry) {
+  if (!routeGeometry) {
+    return [];
+  }
+
+  if (routeGeometry.type === 'LineString') {
+    return normalizeRouteCoordinates(routeGeometry.coordinates ?? []);
+  }
+
+  if (routeGeometry.type === 'MultiLineString') {
+    const coordinates = [];
+    (routeGeometry.coordinates ?? []).forEach((segment) => {
+      appendRouteSegment(coordinates, segment);
+    });
+    return coordinates;
+  }
+
+  if (routeGeometry.type === 'GeometryCollection') {
+    const coordinates = [];
+    (routeGeometry.geometries ?? []).forEach((geometry) => {
+      appendRouteSegment(coordinates, extractRouteCoordinates(geometry));
+    });
+    return coordinates;
+  }
+
   return [];
 }
 
-function buildRouteCoordinatesFromPath(path, roads) {
-  const coordinates = [];
-  
-  path.forEach((roadId) => {
-    const road = roads.find((r) => r.getId() === roadId);
-    if (road) {
-      const geometry = road.getGeometry();
-      if (geometry instanceof LineString) {
-        const roadCoords = geometry.getCoordinates();
-        roadCoords.forEach((coord) => {
-          // 转换为经纬度坐标
-          const lonLat = toLonLat(coord);
-          coordinates.push(lonLat);
-        });
-      }
-    }
-  });
-  
-  return coordinates;
-}
+async function fetchRouteData(start, end) {
+  const response = await fetch(
+    `http://localhost:5000/api/multi-route?start_lon=${start[0]}&start_lat=${start[1]}&end_lon=${end[0]}&end_lat=${end[1]}`
+  );
 
-function calculateRoadLength(road) {
-  const geometry = road.getGeometry();
-  if (geometry instanceof LineString) {
-    return geometry.getLength();
+  if (!response.ok) {
+    throw new Error(`路径规划请求失败: ${response.status}`);
   }
-  return 0;
-}
 
-function calculateDistanceBetweenRoads(road1, road2) {
-  const geom1 = road1.getGeometry();
-  const geom2 = road2.getGeometry();
-  
-  if (geom1 instanceof LineString && geom2 instanceof LineString) {
-    const coords1 = geom1.getCoordinates();
-    const coords2 = geom2.getCoordinates();
-    
-    let minDistance = Infinity;
-    for (const coord1 of coords1) {
-      for (const coord2 of coords2) {
-        const distance = Math.sqrt(
-          Math.pow(coord1[0] - coord2[0], 2) + Math.pow(coord1[1] - coord2[1], 2)
-        );
-        if (distance < minDistance) {
-          minDistance = distance;
-        }
-      }
-    }
-    
-    return minDistance;
+  const data = await response.json();
+  if (data.status !== 'success' || !Array.isArray(data.routes) || data.routes.length === 0) {
+    throw new Error('路径规划服务未返回有效结果');
   }
-  
-  return Infinity;
-}
 
-function calculateDistanceFromPointToRoad(point, road) {
-  const geom = road.getGeometry();
-  if (geom instanceof LineString) {
-    const pointGeom = new Point(fromLonLat(point));
-    return geom.distanceTo(pointGeom);
-  }
-  return Infinity;
-}
+  return {
+    routes: data.routes
+      .map((route) => {
+        const coordinates = extractRouteCoordinates(route.route);
+        const fallbackDistance =
+          coordinates.length > 1
+            ? getLength(new LineString(coordinates), { projection: 'EPSG:4326' })
+            : null;
 
-function calculateRouteLength(coordinates) {
-  let length = 0;
-  for (let i = 1; i < coordinates.length; i++) {
-    const prev = fromLonLat(coordinates[i - 1]);
-    const curr = fromLonLat(coordinates[i]);
-    length += Math.sqrt(
-      Math.pow(curr[0] - prev[0], 2) + Math.pow(curr[1] - prev[1], 2)
-    );
-  }
-  return length;
+        return {
+          key: route.route_key,
+          label: route.label || ROUTE_META[route.route_key]?.label || '路径结果',
+          coordinates,
+          distance: normalizeNumber(route.distance, fallbackDistance),
+          duration: normalizeNumber(route.duration, null),
+          avgSpeed: normalizeNumber(route.avg_speed, null)
+        };
+      })
+      .filter((route) => routeSources[route.key] && route.coordinates.length > 1)
+  };
 }
 
 function clearRoute() {
   state.routeStart = null;
   state.routeEnd = null;
-  routeSource.clear();
+  state.routes = [];
+  Object.values(routeSources).forEach((source) => source.clear());
   markerSource.clear();
   measureSource.clear();
   renderRouteSummary();
@@ -1559,11 +1478,52 @@ function clearMeasure() {
 }
 
 function renderRouteSummary() {
+  const compareCards = state.routes.length
+    ? state.routes
+        .map((route) => {
+          const meta = ROUTE_META[route.key] || {};
+          const distanceText = Number.isFinite(route.distance) ? formatDistance(route.distance) : '--';
+          const durationText = Number.isFinite(route.duration) ? formatDuration(route.duration) : '--';
+          const avgSpeedText = Number.isFinite(route.avgSpeed) ? `${route.avgSpeed.toFixed(1)} km/h` : '--';
+
+          return `
+            <article class="route-compare-card">
+              <div class="route-compare-head">
+                <span class="route-compare-chip" style="--route-color: ${meta.color || '#2563eb'}"></span>
+                <strong>${route.label}</strong>
+              </div>
+              <div class="route-compare-row"><span>路径长度</span><strong>${distanceText}</strong></div>
+              <div class="route-compare-row"><span>预计耗时</span><strong>${durationText}</strong></div>
+              <div class="route-compare-row"><span>平均速度</span><strong>${avgSpeedText}</strong></div>
+            </article>
+          `;
+        })
+        .join('')
+    : `
+        <article class="route-compare-card is-empty">
+          <div class="route-compare-head">
+            <span class="route-compare-chip" style="--route-color: ${ROUTE_META.distance.color}"></span>
+            <strong>${ROUTE_META.distance.label}</strong>
+          </div>
+          <div class="route-compare-row"><span>路径长度</span><strong>--</strong></div>
+          <div class="route-compare-row"><span>预计耗时</span><strong>--</strong></div>
+        </article>
+        <article class="route-compare-card is-empty">
+          <div class="route-compare-head">
+            <span class="route-compare-chip" style="--route-color: ${ROUTE_META.time.color}"></span>
+            <strong>${ROUTE_META.time.label}</strong>
+          </div>
+          <div class="route-compare-row"><span>路径长度</span><strong>--</strong></div>
+          <div class="route-compare-row"><span>预计耗时</span><strong>--</strong></div>
+        </article>
+      `;
+
   refs.routeSummary.innerHTML = `
     <div class="summary-row"><span>起点</span><strong>${state.routeStart ? formatPoint(state.routeStart) : '未设置'}</strong></div>
     <div class="summary-row"><span>终点</span><strong>${state.routeEnd ? formatPoint(state.routeEnd) : '未设置'}</strong></div>
-    <div class="summary-row"><span>路径长度</span><strong>--</strong></div>
-    <div class="summary-row"><span>预计耗时</span><strong>--</strong></div>
+    <div class="route-compare-grid">
+      ${compareCards}
+    </div>
   `;
 }
 
@@ -1939,25 +1899,16 @@ function createSelectionStyle(feature) {
   });
 }
 
-function generateRouteCoordinates(start, end) {
-  const midLon = (start[0] + end[0]) / 2;
-  const midLat = (start[1] + end[1]) / 2;
-  const offset = start[0] <= end[0] ? 0.05 : -0.05;
-
-  return [
-    start,
-    [midLon - offset, midLat + 0.04],
-    [midLon + offset, midLat + 0.02],
-    end
-  ];
-}
-
 function formatDistance(value) {
   return value >= 1000 ? `${(value / 1000).toFixed(2)} km` : `${value.toFixed(0)} m`;
 }
 
 function formatArea(value) {
   return value >= 1000000 ? `${(value / 1000000).toFixed(2)} km²` : `${value.toFixed(0)} m²`;
+}
+
+function formatDuration(value) {
+  return `${value.toFixed(1)} 分钟`;
 }
 
 function formatPoint([lon, lat]) {
