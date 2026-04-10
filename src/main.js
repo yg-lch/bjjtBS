@@ -706,15 +706,6 @@ const selectionSource = new VectorSource();
 const measureSource = new VectorSource();
 
 const routeLayers = {
-  distance: new VectorLayer({
-    source: routeSources.distance,
-    style: new Style({
-      stroke: new Stroke({
-        color: ROUTE_META.distance.color,
-        width: ROUTE_META.distance.width
-      })
-    })
-  }),
   time: new VectorLayer({
     source: routeSources.time,
     style: new Style({
@@ -722,6 +713,15 @@ const routeLayers = {
         color: ROUTE_META.time.color,
         width: ROUTE_META.time.width,
         lineDash: ROUTE_META.time.lineDash
+      })
+    })
+  }),
+  distance: new VectorLayer({
+    source: routeSources.distance,
+    style: new Style({
+      stroke: new Stroke({
+        color: ROUTE_META.distance.color,
+        width: ROUTE_META.distance.width
       })
     })
   })
@@ -1295,13 +1295,17 @@ async function buildRoute() {
     }
 
     state.routes.forEach((route) => {
+      console.log(`添加路径 ${route.key} 到地图: 坐标数量=${route.coordinates.length}`);
       const transformedCoordinates = route.coordinates.map((coordinate) => fromLonLat(coordinate));
-      routeSources[route.key].addFeature(
-        new Feature({
-          geometry: new LineString(transformedCoordinates),
-          routeKey: route.key
-        })
-      );
+      console.log(`转换后的坐标数量: ${transformedCoordinates.length}`);
+      
+      const feature = new Feature({
+        geometry: new LineString(transformedCoordinates),
+        routeKey: route.key
+      });
+      
+      routeSources[route.key].addFeature(feature);
+      console.log(`路径 ${route.key} 添加到地图成功`);
     });
 
     renderRouteSummary();
@@ -1419,38 +1423,54 @@ function extractRouteCoordinates(routeGeometry) {
 }
 
 async function fetchRouteData(start, end) {
+  console.log('调用路径规划API:', start, end);
+  
   const response = await fetch(
     `http://localhost:5000/api/multi-route?start_lon=${start[0]}&start_lat=${start[1]}&end_lon=${end[0]}&end_lat=${end[1]}`
   );
 
+  console.log('多路径API响应状态:', response.status);
+  
   if (!response.ok) {
     throw new Error(`路径规划请求失败: ${response.status}`);
   }
 
   const data = await response.json();
+  console.log('多路径API返回数据:', data);
+  
   if (data.status !== 'success' || !Array.isArray(data.routes) || data.routes.length === 0) {
     throw new Error('路径规划服务未返回有效结果');
   }
 
-  return {
-    routes: data.routes
-      .map((route) => {
-        const coordinates = extractRouteCoordinates(route.route);
-        const fallbackDistance =
-          coordinates.length > 1
-            ? getLength(new LineString(coordinates), { projection: 'EPSG:4326' })
-            : null;
+  const processedRoutes = data.routes
+    .map((route) => {
+      const coordinates = extractRouteCoordinates(route.route);
+      console.log(`处理路径 ${route.route_key}: 坐标数量=${coordinates.length}`);
+      
+      const fallbackDistance =
+        coordinates.length > 1
+          ? getLength(new LineString(coordinates), { projection: 'EPSG:4326' })
+          : null;
 
-        return {
-          key: route.route_key,
-          label: route.label || ROUTE_META[route.route_key]?.label || '路径结果',
-          coordinates,
-          distance: normalizeNumber(route.distance, fallbackDistance),
-          duration: normalizeNumber(route.duration, null),
-          avgSpeed: normalizeNumber(route.avg_speed, null)
-        };
-      })
-      .filter((route) => routeSources[route.key] && route.coordinates.length > 1)
+      return {
+        key: route.route_key,
+        label: route.label || ROUTE_META[route.route_key]?.label || '路径结果',
+        coordinates,
+        distance: normalizeNumber(route.distance, fallbackDistance),
+        duration: normalizeNumber(route.duration, null),
+        avgSpeed: normalizeNumber(route.avg_speed, null)
+      };
+    })
+    .filter((route) => {
+      const valid = routeSources[route.key] && route.coordinates.length > 1;
+      console.log(`过滤路径 ${route.key}: 有效=${valid}, routeSources存在=${!!routeSources[route.key]}, 坐标数量=${route.coordinates.length}`);
+      return valid;
+    });
+  
+  console.log('处理后的路径:', processedRoutes);
+  
+  return {
+    routes: processedRoutes
   };
 }
 
